@@ -12,7 +12,20 @@ app = Flask(__name__)
 # ตำแหน่งของไฟล์ฐานข้อมูล (สำคัญสำหรับ Render)
 db_path = os.path.join(os.environ.get('RENDER_DISK_PATH', os.path.dirname(os.path.abspath(__file__))), 'database.sqlite3')
 app.config['SECRET_KEY'] = 'a_very_robust_database_secret_key'
-app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{db_path}'
+# --- 1. SETUP & CONFIGURATION (เวอร์ชัน PostgreSQL) ---
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'my_super_secure_postgresql_secret_key'
+
+# อ่าน Database URL จาก Environment Variable ของ Render
+# ถ้าหาไม่เจอ (ตอนรันในเครื่อง) ให้ใช้ไฟล์ SQLite ชั่วคราวไปก่อน
+DATABASE_URL = os.environ.get('DATABASE_URL')
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL or f"sqlite:///{os.path.join(os.path.dirname(os.path.abspath(__file__)), 'local_dev.sqlite3')}"
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+db = SQLAlchemy(app)
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 db = SQLAlchemy(app)
