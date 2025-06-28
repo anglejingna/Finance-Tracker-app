@@ -5,6 +5,7 @@ __pycache__/
 # Data files
 *.pkl
 *.migrated
+*.sqlite3
 
 # Environment
 .env
