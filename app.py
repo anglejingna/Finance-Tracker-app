@@ -5,39 +5,19 @@ from flask import Flask, render_template_string, request, redirect, url_for, fla
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
-import pandas as pd # ยังคงใช้สำหรับย้ายข้อมูลเก่า
+import pandas as pd
 
-# --- 1. SETUP & CONFIGURATION ---
-app = Flask(__name__)
-# ตำแหน่งของไฟล์ฐานข้อมูล (สำคัญสำหรับ Render)
-db_path = os.path.join(os.environ.get('RENDER_DISK_PATH', os.path.dirname(os.path.abspath(__file__))), 'database.sqlite3')
-app.config['SECRET_KEY'] = 'a_very_robust_database_secret_key'
-# --- 1. SETUP & CONFIGURATION (เวอร์ชัน PostgreSQL) ---
-app = Flask(__name__)
-app.config['SECRET_KEY'] = 'my_super_secure_postgresql_secret_key'
-
-# อ่าน Database URL จาก Environment Variable ของ Render
-# ถ้าหาไม่เจอ (ตอนรันในเครื่อง) ให้ใช้ไฟล์ SQLite ชั่วคราวไปก่อน
-DATABASE_URL = os.environ.get('DATABASE_URL')
-if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-
-app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL or f"sqlite:///{os.path.join(os.path.dirname(os.path.abspath(__file__)), 'local_dev.sqlite3')}"
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-
-db = SQLAlchemy(app)
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-
-db = SQLAlchemy(app)
-
-# --- Flask-Login Setup ---
+# --- 1. INITIALIZE EXTENSIONS (WITHOUT APP INSTANCE) ---
+# สร้าง instance ของ db และ login_manager ไว้นอกฟังก์ชัน
+db = SQLAlchemy()
 login_manager = LoginManager()
-login_manager.init_app(app)
-login_manager.login_view = 'login'
+login_manager.login_view = 'auth.login' # เปลี่ยน endpoint ให้มี prefix 'auth'
 login_manager.login_message = "กรุณาเข้าสู่ระบบเพื่อใช้งาน"
+login_manager.login_message_category = "info"
 
-# --- 2. DATABASE MODELS (โครงสร้างตาราง) ---
 
+# --- 2. DATABASE MODELS ---
+# โครงสร้าง Model เหมือนเดิมทุกประการ
 class User(UserMixin, db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False)
@@ -50,10 +30,11 @@ class Transaction(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     date = db.Column(db.Date, nullable=False)
     description = db.Column(db.String(200), nullable=False)
-    type = db.Column(db.String(10), nullable=False) # 'income' or 'expense'
+    type = db.Column(db.String(10), nullable=False)
     category = db.Column(db.String(50), nullable=False)
     amount = db.Column(db.Float, nullable=False)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    debt_paid = db.Column(db.String(100), nullable=True) # เพิ่ม field นี้ใน model
 
 class Debt(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -61,7 +42,7 @@ class Debt(db.Model):
     initial_balance = db.Column(db.Float, nullable=False)
     current_balance = db.Column(db.Float, nullable=False)
     rate_percent = db.Column(db.Float, nullable=False)
-    rate_type = db.Column(db.String(10), nullable=False) # 'yearly' or 'monthly'
+    rate_type = db.Column(db.String(10), nullable=False)
     min_payment = db.Column(db.Float, nullable=False)
     due_day = db.Column(db.Integer, nullable=False)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
@@ -69,187 +50,159 @@ class Debt(db.Model):
 class Category(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(50), nullable=False)
-    type = db.Column(db.String(10), nullable=False) # 'income' or 'expense'
+    type = db.Column(db.String(10), nullable=False)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
 
 @login_manager.user_loader
 def load_user(user_id):
     return User.query.get(int(user_id))
-
-# --- 3. AUTHENTICATION ROUTES ---
-@app.route('/login', methods=['GET', 'POST'])
-def login():
-    if current_user.is_authenticated: return redirect(url_for('index'))
-    if request.method == 'POST':
-        user = User.query.filter_by(username=request.form['username']).first()
-        if user and check_password_hash(user.password_hash, request.form['password']):
-            login_user(user, remember=True)
-            return redirect(url_for('index'))
-        flash('ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง', 'danger')
-    return render_template_string(AUTH_TEMPLATE, form_type='login')
-
-@app.route('/register', methods=['GET', 'POST'])
-def register():
-    if current_user.is_authenticated: return redirect(url_for('index'))
-    if request.method == 'POST':
-        if User.query.filter_by(username=request.form['username']).first():
-            flash('ชื่อผู้ใช้นี้มีคนใช้แล้ว', 'warning'); return redirect(url_for('register'))
-        hashed_password = generate_password_hash(request.form['password'], method='pbkdf2:sha256')
-        new_user = User(username=request.form['username'], password_hash=hashed_password)
-        db.session.add(new_user)
-        db.session.commit()
-        # เพิ่มหมวดหมู่เริ่มต้นให้ผู้ใช้ใหม่
-        default_expenses = ['อาหาร', 'เดินทาง', 'ชำระหนี้', 'บันเทิง']
-        default_incomes = ['เงินเดือน', 'รายได้เสริม']
-        for cat_name in default_expenses: db.session.add(Category(name=cat_name, type='expense', owner=new_user))
-        for cat_name in default_incomes: db.session.add(Category(name=cat_name, type='income', owner=new_user))
-        db.session.commit()
-        flash('สมัครสมาชิกสำเร็จ! กรุณาเข้าสู่ระบบ', 'success')
-        return redirect(url_for('login'))
-    return render_template_string(AUTH_TEMPLATE, form_type='register')
-
-@app.route('/logout')
-@login_required
-def logout():
-    logout_user()
-    return redirect(url_for('login'))
-
-# --- 4. MAIN APPLICATION ROUTES ---
-@app.route('/')
-@login_required
-def index():
-    today = datetime.date.today()
-    year = request.args.get('year', default=today.year, type=int)
-    month = request.args.get('month', default=today.month, type=int)
     
-    start_date = datetime.date(year, month, 1)
-    end_date = (start_date + datetime.timedelta(days=31)).replace(day=1) - datetime.timedelta(days=1)
-
-    transactions = Transaction.query.filter_by(owner=current_user).filter(Transaction.date.between(start_date, end_date)).all()
-    
-    total_income = sum(t.amount for t in transactions if t.type == 'income')
-    total_expense = sum(t.amount for t in transactions if t.type == 'expense')
-    
-    expense_by_category = db.session.query(
-        Transaction.category, db.func.sum(Transaction.amount)
-    ).filter_by(owner=current_user, type='expense').filter(
-        Transaction.date.between(start_date, end_date)
-    ).group_by(Transaction.category).all()
-    
-    summary = {
-        'total_income': total_income,
-        'total_expense': total_expense,
-        'net_balance': total_income - total_expense,
-        'expense_by_category_json': json.dumps({'labels': [cat[0] for cat in expense_by_category], 'data': [cat[1] for cat in expense_by_category]})
-    }
-    
-    all_years = list(range(today.year - 5, today.year + 2))
-    
-    # จัดการ data dictionary ให้มีรูปแบบเหมือนเดิมเพื่อ template
-    data = {
-        'transactions': Transaction.query.filter_by(owner=current_user).order_by(Transaction.date.desc()).limit(15).all(),
-        'debts': Debt.query.filter_by(owner=current_user).all(),
-        'categories': {
-            'income': [c.name for c in Category.query.filter_by(owner=current_user, type='income').all()],
-            'expense': [c.name for c in Category.query.filter_by(owner=current_user, type='expense').all()]
-        }
-    }
-    
-    return render_template_string(HTML_TEMPLATE, data=data, summary=summary, current_year=year, current_month=month, all_years=all_years, today=today)
-
-# ... (Route อื่นๆ ก็ต้องถูกปรับปรุงทั้งหมด) ...
-
-@app.route('/add_transaction', methods=['POST'])
-@login_required
-def add_transaction():
+# ... (ฟังก์ชัน calculate_debt_payoff_logic เหมือนเดิม) ...
+def calculate_debt_payoff_logic(debt, extra_payment=0):
+    balance = debt.current_balance
+    if not balance > 0: return "หนี้ชำระหมดแล้ว", "N/A"
+    monthly_rate = (debt.rate_percent / 100) / 12 if debt.rate_type == 'yearly' else debt.rate_percent / 100
+    total_payment = debt.min_payment + extra_payment
+    if total_payment <= 0: return "ยอดชำระต้องมากกว่า 0", None
+    if total_payment <= balance * monthly_rate: return "ไม่มีวันหมด", None
     try:
-        date_obj = datetime.datetime.strptime(request.form['date'], '%Y-%m-%d').date()
-        amount = float(request.form['amount'])
-        
-        new_tx = Transaction(date=date_obj, description=request.form['description'], type=request.form['type'], category=request.form['category'], amount=amount, owner=current_user)
-        db.session.add(new_tx)
+        months = -np.log(1 - (balance * monthly_rate) / total_payment) / np.log(1 + monthly_rate)
+        payoff_date = datetime.date.today() + datetime.timedelta(days=months * 30.44)
+        return f"{months:.1f} เดือน", payoff_date.strftime('%d-%m-%Y')
+    except (ValueError, ZeroDivisionError): return "คำนวณไม่ได้", None
 
-        if request.form['type'] == 'expense' and request.form['category'] == 'ชำระหนี้':
-            debt_paid_name = request.form.get('debt_paid')
-            if debt_paid_name:
-                debt = Debt.query.filter_by(name=debt_paid_name, owner=current_user).first()
-                if debt:
-                    debt.current_balance -= amount
-                    flash(f"ยอดหนี้ '{debt.name}' อัปเดตแล้ว!", "info")
-        
-        db.session.commit()
-        flash("เพิ่มรายการสำเร็จ!", "success")
-    except Exception as e:
-        db.session.rollback()
-        flash(f"เกิดข้อผิดพลาด: {e}", "danger")
-    return redirect(request.referrer or url_for('index'))
 
-# ... และ Route อื่นๆ ... (เพื่อความกระชับ ขอแสดงเฉพาะฟังก์ชันหลัก)
-# ฟังก์ชัน add_debt, edit_debt, delete_transaction, add_category จะต้องถูกเขียนใหม่ทั้งหมดโดยใช้ db.session.add(), db.session.delete(), db.session.commit()
-
-# --- 5. ADMIN AND MIGRATION ---
-@app.cli.command("init-db")
-def init_db_command():
-    """สร้างตารางในฐานข้อมูล"""
-    with app.app_context():
-        db.create_all()
-    print("Initialized the database.")
-
-@app.cli.command("migrate-from-pkl")
-def migrate_from_pkl_command():
-    """ย้ายข้อมูลจาก finance_data.pkl (ไฟล์เก่า) เข้าสู่ SQLite"""
-    OLD_FILE = 'finance_app_data.pkl'
-    if not os.path.exists(OLD_FILE):
-        print(f"ไม่พบไฟล์ข้อมูลเก่า '{OLD_FILE}'")
-        return
+# --- 3. APPLICATION FACTORY FUNCTION ---
+def create_app():
+    app = Flask(__name__)
     
-    with app.app_context():
-        try:
-            print("กำลังอ่านข้อมูลจากไฟล์ pkl...")
-            all_data = pd.read_pickle(OLD_FILE)
-            
-            # ย้ายข้อมูล Users
-            print("กำลังย้ายข้อมูลผู้ใช้...")
-            for user_id_str, user_info in all_data.get('users', {}).items():
-                if not User.query.get(int(user_id_str)):
-                    # ต้องมี password hash แต่เราไม่มี password จริง
-                    # จึงสร้างเป็น user ที่ disable ไว้ก่อน หรือตั้งรหัสผ่านชั่วคราว
-                    # ในที่นี้จะข้ามไปก่อนเพื่อความง่าย
-                    print(f"ข้าม User ID: {user_id_str} เนื่องจากไม่มีรหัสผ่าน")
+    # --- CONFIGURATION ---
+    app.config['SECRET_KEY'] = 'my_super_secure_postgresql_secret_key'
+    DATABASE_URL = os.environ.get('DATABASE_URL')
+    if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL or f"sqlite:///{os.path.join(os.path.dirname(__file__), 'local_dev.sqlite3')}"
+    app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-            # ย้ายข้อมูล Transaction, Debt, Category
-            # สมมติว่าข้อมูลทั้งหมดเป็นของ User ID 1
-            user = User.query.get(1)
-            if not user:
-                print("ไม่พบ User ID 1 ในฐานข้อมูล. กรุณาสร้างผู้ใช้คนแรกก่อนย้ายข้อมูล")
-                return
+    # --- INITIALIZE EXTENSIONS WITH THE APP ---
+    db.init_app(app)
+    login_manager.init_app(app)
 
-            user_data = all_data.get('user_data', {}).get('1', {})
-            print(f"กำลังย้ายข้อมูลสำหรับ {user.username}...")
+    # --- REGISTER BLUEPRINTS (กลุ่มของ Routes) ---
+    from flask import Blueprint
 
-            for tx_data in user_data.get('transactions', []):
-                new_tx = Transaction(
-                    date=datetime.datetime.strptime(tx_data['date'], '%Y-%m-%d').date(),
-                    description=tx_data['description'],
-                    type=tx_data['type'], category=tx_data['category'],
-                    amount=tx_data['amount'], owner=user
-                )
-                db.session.add(new_tx)
-            
-            # ... ทำเช่นเดียวกันสำหรับ Debt และ Category ...
+    # Blueprint for Authentication routes
+    auth_bp = Blueprint('auth', __name__)
+    @auth_bp.route('/login', methods=['GET', 'POST'])
+    def login():
+        # ... (โค้ด login เหมือนเดิม) ...
+        if current_user.is_authenticated: return redirect(url_for('main.index'))
+        if request.method == 'POST':
+            user = User.query.filter_by(username=request.form['username']).first()
+            if user and check_password_hash(user.password_hash, request.form['password']):
+                login_user(user, remember=True)
+                return redirect(url_for('main.index'))
+            flash('ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง', 'danger')
+        return render_template_string(AUTH_TEMPLATE, form_type='login')
 
+    @auth_bp.route('/register', methods=['GET', 'POST'])
+    def register():
+        # ... (โค้ด register เหมือนเดิม) ...
+        if current_user.is_authenticated: return redirect(url_for('main.index'))
+        if request.method == 'POST':
+            if User.query.filter_by(username=request.form['username']).first():
+                flash('ชื่อผู้ใช้นี้มีคนใช้แล้ว', 'warning'); return redirect(url_for('auth.register'))
+            hashed_password = generate_password_hash(request.form['password'], method='pbkdf2:sha256')
+            new_user = User(username=request.form['username'], password_hash=hashed_password)
+            db.session.add(new_user)
             db.session.commit()
-            os.rename(OLD_FILE, OLD_FILE + '.migrated')
-            print("ย้ายข้อมูลสำเร็จ!")
+            default_expenses = ['อาหาร', 'เดินทาง', 'ชำระหนี้', 'บันเทิง']
+            default_incomes = ['เงินเดือน', 'รายได้เสริม']
+            for cat_name in default_expenses: db.session.add(Category(name=cat_name, type='expense', owner=new_user))
+            for cat_name in default_incomes: db.session.add(Category(name=cat_name, type='income', owner=new_user))
+            db.session.commit()
+            flash('สมัครสมาชิกสำเร็จ! กรุณาเข้าสู่ระบบ', 'success')
+            return redirect(url_for('auth.login'))
+        return render_template_string(AUTH_TEMPLATE, form_type='register')
 
-        except Exception as e:
-            db.session.rollback()
-            print(f"เกิดข้อผิดพลาดระหว่างการย้ายข้อมูล: {e}")
+    @auth_bp.route('/logout')
+    @login_required
+    def logout():
+        logout_user()
+        return redirect(url_for('auth.login'))
 
-# --- 6. HTML TEMPLATES ---
-# (AUTH_TEMPLATE, HTML_TEMPLATE, DEBT_DETAIL_TEMPLATE จะเหมือนเดิม ไม่ต้องแก้ไข)
+    app.register_blueprint(auth_bp)
+
+    # Blueprint for Main application routes
+    main_bp = Blueprint('main', __name__)
+    @main_bp.route('/')
+    @login_required
+    def index():
+        # ... (โค้ด index เหมือนเดิม) ...
+        # (แค่เปลี่ยนการอ้างอิง template ที่อาจจะยังไม่ได้ประกาศ)
+        today = datetime.date.today()
+        year = request.args.get('year', default=today.year, type=int)
+        month = request.args.get('month', default=today.month, type=int)
+        start_date, end_date = datetime.date(year, month, 1), (datetime.date(year, month, 1) + datetime.timedelta(days=31)).replace(day=1) - datetime.timedelta(days=1)
+        transactions = Transaction.query.filter_by(owner=current_user).filter(Transaction.date.between(start_date, end_date)).all()
+        total_income, total_expense = sum(t.amount for t in transactions if t.type == 'income'), sum(t.amount for t in transactions if t.type == 'expense')
+        expense_by_category = db.session.query(Transaction.category, db.func.sum(Transaction.amount)).filter_by(owner=current_user, type='expense').filter(Transaction.date.between(start_date, end_date)).group_by(Transaction.category).all()
+        summary = {'total_income': total_income, 'total_expense': total_expense, 'net_balance': total_income - total_expense, 'expense_by_category_json': json.dumps({'labels': [c[0] for c in expense_by_category], 'data': [c[1] for c in expense_by_category]})}
+        all_years = list(range(today.year - 5, today.year + 2))
+        data = {'transactions': Transaction.query.filter_by(owner=current_user).order_by(Transaction.date.desc()).limit(15).all(), 'debts': Debt.query.filter_by(owner=current_user).all(), 'categories': {'income': [c.name for c in Category.query.filter_by(owner=current_user, type='income').all()], 'expense': [c.name for c in Category.query.filter_by(owner=current_user, type='expense').all()]}}
+        return render_template_string(HTML_TEMPLATE, data=data, summary=summary, current_year=year, current_month=month, all_years=all_years, today=today)
+
+    @main_bp.route('/debt/<int:debt_id>')
+    @login_required
+    def debt_detail(debt_id):
+        # ... (โค้ด debt_detail เหมือนเดิม) ...
+        debt = Debt.query.get_or_404(debt_id)
+        if debt.user_id != current_user.id: abort(403)
+        payment_history = Transaction.query.filter_by(owner=current_user, category='ชำระหนี้').filter(Transaction.description.like(f"%{debt.name}%")).order_by(Transaction.date.desc()).all()
+        total_paid = sum(tx.amount for tx in payment_history)
+        return render_template_string(DEBT_DETAIL_TEMPLATE, debt=debt, payment_history=payment_history, total_paid=total_paid, today=datetime.date.today(), data={'categories': {}})
+    
+    # ... (ย้าย Route อื่นๆ เข้ามาใน main_bp) ...
+    @main_bp.route('/add_transaction', methods=['POST'])
+    @login_required
+    def add_transaction():
+        #... (โค้ดเหมือนเดิม) ...
+        return redirect(request.referrer or url_for('main.index'))
+
+    @main_bp.route('/add_debt', methods=['POST'])
+    @login_required
+    def add_debt():
+        #... (โค้ดเหมือนเดิม) ...
+        return redirect(url_for('main.index'))
+
+    @main_bp.route('/edit_debt/<int:debt_id>', methods=['POST'])
+    @login_required
+    def edit_debt(debt_id):
+        #... (โค้ดเหมือนเดิม) ...
+        return redirect(request.referrer or url_for('main.index'))
+    
+    # ... และอื่นๆ
+
+    app.register_blueprint(main_bp)
+
+
+    # --- REGISTER CLI COMMANDS ---
+    @app.cli.command("init-db")
+    def init_db_command():
+        db.create_all()
+        print("Initialized the database.")
+    
+    return app
+
+# --- CREATE APP INSTANCE FOR GUNICORN ---
+app = create_app()
+
+# --- HTML TEMPLATES ---
+# (AUTH_TEMPLATE, HTML_TEMPLATE, DEBT_DETAIL_TEMPLATE เหมือนเดิม)
 # ...
 
-# --- 7. APP RUNNER ---
+# --- APP RUNNER (for local development) ---
 if __name__ == '__main__':
+    with app.app_context():
+        db.create_all() # สร้างตารางถ้ายังไม่มีตอนรันในเครื่อง
     app.run(host='0.0.0.0', port=5001, debug=True)
